@@ -1,7 +1,6 @@
 package claudecode
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -262,20 +261,31 @@ func sendPrompt(stdin io.WriteCloser, prompt string) {
 }
 
 func streamMessages(ctx context.Context, stdout io.ReadCloser, messageChan chan<- Message, errorChan chan<- error) bool {
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
+	decoder := json.NewDecoder(stdout)
+	
+	for {
 		var rawMessage map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &rawMessage); err != nil {
-			errorChan <- &CLIJSONDecodeError{
-				Data:  line,
-				Cause: err,
+		err := decoder.Decode(&rawMessage)
+		
+		if err == io.EOF {
+			// End of stream reached normally
+			return true
+		}
+		
+		if err != nil {
+			// Check if it's a context cancellation
+			select {
+			case <-ctx.Done():
+				errorChan <- ctx.Err()
+				return false
+			default:
+				// JSON decode error
+				errorChan <- &CLIJSONDecodeError{
+					Data:  fmt.Sprintf("%v", err),
+					Cause: err,
+				}
+				return false
 			}
-			return false
 		}
 
 		message, err := parseMessage(rawMessage)
@@ -291,16 +301,6 @@ func streamMessages(ctx context.Context, stdout io.ReadCloser, messageChan chan<
 			return false
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		errorChan <- &CLIConnectionError{
-			Message: "error reading CLI output",
-			Cause:   err,
-		}
-		return false
-	}
-
-	return true
 }
 
 func waitForStreamCommand(cmd *exec.Cmd, stderr io.ReadCloser, errorChan chan<- error) {
@@ -496,19 +496,20 @@ func readTextOutput(reader io.Reader) ([]Message, error) {
 // readMessages reads and parses messages from the CLI output
 func readMessages(reader io.Reader) ([]Message, error) {
 	var messages []Message
-	scanner := bufio.NewScanner(reader)
+	decoder := json.NewDecoder(reader)
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
-		// Parse JSON message
+	for {
 		var rawMessage map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &rawMessage); err != nil {
+		err := decoder.Decode(&rawMessage)
+		
+		if err == io.EOF {
+			// End of stream reached normally
+			break
+		}
+		
+		if err != nil {
 			return nil, &CLIJSONDecodeError{
-				Data:  line,
+				Data:  fmt.Sprintf("%v", err),
 				Cause: err,
 			}
 		}
@@ -519,13 +520,6 @@ func readMessages(reader io.Reader) ([]Message, error) {
 		}
 
 		messages = append(messages, message)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, &CLIConnectionError{
-			Message: "error reading CLI output",
-			Cause:   err,
-		}
 	}
 
 	return messages, nil
